@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pystow
 import pandas as pd
@@ -16,7 +16,10 @@ from indra_cogex.client import process_identifier
 from indra_cogex.representation import dump_norm_id
 from indra_cogex.sources.clinicaltrials.grounders import ClinicalTrialsDrugGrounder
 from trialsynth.ctgov import config, process
-from trialsynth.base.extract.paths import RESULTS_GROUNDED_DIR
+from trialsynth.base.extract.paths import (
+    RESULTS_GROUNDED_CTGOV_DIR,
+    RESULTS_GROUNDED_DIR,
+)
 
 
 def _clean(text: str) -> str:
@@ -54,6 +57,13 @@ INTERVENTION_LABELS = {
 
 
 logger = logging.getLogger(__name__)
+
+#: Corpus name -> (grounded JSON dir, record ID field, namespace of the node
+#: owning the TrialResult)
+RESULT_CORPORA = {
+    "pubmed": (RESULTS_GROUNDED_DIR.base, "pmid", "PUBMED"),
+    "ctgov": (RESULTS_GROUNDED_CTGOV_DIR.base, "nct_id", "CLINICALTRIALS"),
+}
 
 
 def ensure_clinical_trials_df(
@@ -410,43 +420,70 @@ def process_trialsynth_trial_nodes() -> pd.DataFrame:
 
 
 def _load_jsons(
-    json_dir: Path = RESULTS_GROUNDED_DIR.base,
+    json_dir: Path,
+    id_field: str,
     index_start: int = 1,
+    allowed_ids: Optional[Set[str]] = None,
 ) -> List[Tuple[int, str, dict]]:
-    """Load all grounded JSON files, returning (result_id, pmid, data) tuples.
+    """Load all grounded JSON files, returning (result_id, record_id, data) tuples.
 
     Parameters
     ----------
     json_dir :
         Path to directory containing grounded JSON files.
+    id_field :
+        Key holding the record ID (e.g. pmid or nct_id) in each JSON.
+    index_start :
+        The result_id assigned to the first file.
+    allowed_ids :
+        If given, records whose ID is not in this set are skipped and do not
+        consume a result_id.
 
     Returns
     -------
     :
-        List of (result_id, pmid, data) tuples, one per JSON file.
+        List of (result_id, record_id, data) tuples, one per JSON file.
     """
     records = []
-    for result_id, path in enumerate(sorted(json_dir.glob("*.json")), start=index_start):
+    n_skipped = 0
+    for path in sorted(json_dir.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            pmid = str(data.get("pmid", path.stem))
-            records.append((result_id, pmid, data))
         except Exception as e:
             logger.warning("Failed to load %s: %s", path.name, e)
+            continue
+        record_id = str(data.get(id_field, path.stem))
+        if allowed_ids is not None and record_id not in allowed_ids:
+            n_skipped += 1
+            continue
+        records.append((index_start + len(records), record_id, data))
     logger.info("Loaded %d JSON files from %s", len(records), json_dir)
+    if n_skipped:
+        logger.info("Skipped %d records with an ID not in allowed_ids", n_skipped)
     return records
 
 
+def _get_trial_nct_ids() -> Set[str]:
+    """Return the NCT IDs of the ClinicalTrial nodes built from trialsynth."""
+    curies = pd.read_csv(
+        ctconfig.trials_path, sep="\t", compression="gzip", usecols=["curie:CURIE"]
+    )["curie:CURIE"]
+    return {curie.split(":", 1)[1] for curie in curies.dropna()}
+
+
 def load_all(
-    json_dir: Path = RESULTS_GROUNDED_DIR.base,
+    corpora: Tuple[str, ...] = ("pubmed", "ctgov"),
     look_up_current_max_ids: bool = False,
 ) -> Dict[str, pd.DataFrame]:
     """Load all grounded JSONs in a single pass and return all DataFrames.
 
+    All corpora share one set of ID counters so node IDs stay unique across
+    them.
+
     Parameters
     ----------
-    json_dir :
-        Path to the directory containing grounded JSON files.
+    corpora :
+        Names of the corpora in RESULT_CORPORA to load.
     look_up_current_max_ids :
         If True, look up the current max IDs in the database and use them to
         set the IDs for the nodes. This is useful for loading data into a
@@ -455,12 +492,13 @@ def load_all(
     Returns
     -------
     :
-        Dictionary with keys: result_nodes, arms, metrics, adverse_events,
-        criteria, outcomes, stat_comparisons, genetic_edges, ae_bioentity_edges,
-        publication_edges.
+        Dictionary with keys: result_nodes, arms, as_run_arms, metrics,
+        adverse_events, criteria, outcomes, stat_comparisons, genetic_edges,
+        ae_bioentity_edges, criterion_bioentity_edges, source_edges.
     """
     result_nodes = []
     arms = []
+    as_run_arms = []
     metrics = []
     adverse_events = []
     criteria = []
@@ -468,7 +506,8 @@ def load_all(
     stat_comparisons = []
     genetic_edges = []
     ae_bioentity_edges = []
-    publication_edges = []
+    criterion_bioentity_edges = []
+    source_edges = []
 
     if look_up_current_max_ids:
         from indra_cogex.client import Neo4jClient
@@ -477,6 +516,7 @@ def load_all(
         RETURN max(toInteger(split(n.id, ':')[-1])) AS max_id"""
         labels = [
             ("TrialArm", "arm_id"),
+            ("TrialAsRunArm", "as_run_arm_id"),
             ("TrialAdverseEvent", "ae_id"),
             ("TrialCriterion", "criterion_id"),
             ("TrialMetric", "metric_id"),
@@ -490,11 +530,12 @@ def load_all(
         for label, id_name in labels:
             query = node_match_query_template.format(node_label=label)
             rows = client.query_tx(query)
-            max_id = int(rows[0][0]) if rows else 0
+            max_id = int(rows[0][0] or 0) if rows else 0
             index_map[id_name] = max_id + 1
     else:
         index_map = {
             "arm_id": 1,
+            "as_run_arm_id": 1,
             "ae_id": 1,
             "criterion_id": 1,
             "metric_id": 1,
@@ -503,122 +544,164 @@ def load_all(
             "stat_id": 1,
         }
 
-    for result_id, pmid, data in _load_jsons(
-        json_dir, index_start=index_map["result_id"]
-    ):
-        result_nodes.append({
-            "result_id": result_id,
-            "study_info": _clean(data.get("study_info", "")),
-            "trial_ids:string[]": ";".join(data.get("trial_ids", [])),
-            "phase": data.get("phase") or "",
-            "locations:string[]": ";".join(data.get("locations", [])),
-        })
-        publication_edges.append({"pmid": pmid, "result_id": result_id})
-
-        for arm in data.get("arms", []):
-            arms.append({
+    for corpus in corpora:
+        json_dir, id_field, source_ns = RESULT_CORPORA[corpus]
+        # Registry results attach directly to a ClinicalTrial node, so only
+        # keep those whose trial exists in the trialsynth trial nodes
+        allowed_ids = _get_trial_nct_ids() if source_ns == "CLINICALTRIALS" else None
+        records = _load_jsons(
+            json_dir,
+            id_field,
+            index_start=index_map["result_id"],
+            allowed_ids=allowed_ids,
+        )
+        if records:
+            index_map["result_id"] = records[-1][0] + 1
+        for result_id, record_id, data in records:
+            randomization = data.get("randomization") or {}
+            recruitment = data.get("recruitment") or {}
+            result_nodes.append({
                 "result_id": result_id,
-                "arm_id": index_map["arm_id"],
-                "arm_name": _clean(arm.get("arm_name", "")),
-                "n": arm.get("n"),
-                "dosage": _clean(arm.get("dosage") or ""),
-                "source_sentence": _clean(arm.get("source_sentence", "")),
+                "study_info": _clean(data.get("study_info", "")),
+                "trial_ids:string[]": ";".join(data.get("trial_ids", [])),
+                "phase": data.get("phase") or "",
+                "locations:string[]": ";".join(data.get("locations", [])),
+                "randomization_ratio": _clean(randomization.get("ratio") or ""),
+                "randomization_stratification_factors:string[]": ";".join(
+                    _clean(f).replace(";", ",")
+                    for f in randomization.get("stratification_factors") or []
+                ),
+                "recruitment_channel": _clean(recruitment.get("channel") or ""),
+                "recruitment_window": _clean(recruitment.get("window") or ""),
             })
-            for m in arm.get("metrics", []):
-                metrics.append({
-                    "parent_ns": "arm",
-                    "parent_id": index_map["arm_id"],
-                    "metric_id": index_map["metric_id"],
-                    "name": _clean(m.get("name", "")),
-                    "value_numeric": m.get("value_numeric"),
-                    "unit": _clean(m.get("unit", "")),
-                    "value_text": _clean(m.get("value_text", "")),
-                    "source_sentence": _clean(m.get("source_sentence", "")),
-                })
-                index_map["metric_id"] += 1
-            for ae in arm.get("adverse_events", []):
-                adverse_events.append({
+            source_edges.append({
+                "source_ns": source_ns,
+                "source_id": record_id,
+                "result_id": result_id,
+            })
+
+            for arm in data.get("arms", []):
+                arms.append({
+                    "result_id": result_id,
                     "arm_id": index_map["arm_id"],
-                    "adverseevent_id": index_map["ae_id"],
-                    "event_name": _clean(ae.get("event_name", "")),
-                    "incidence_numeric": ae.get("incidence_numeric"),
-                    "unit": _clean(ae.get("unit", "")),
-                    "value_text": _clean(ae.get("value_text", "")),
-                    "source_sentence": _clean(ae.get("source_sentence", "")),
+                    "arm_name": _clean(arm.get("arm_name", "")),
+                    "arm_type": _clean(arm.get("arm_type") or ""),
+                    "n": arm.get("n"),
+                    "dosage": _clean(arm.get("dosage") or ""),
+                    "source_sentence": _clean(arm.get("source_sentence", "")),
                 })
-                grounding = ae.get("grounding") or {}
-                if grounding.get("db") and grounding.get("id"):
-                    ae_bioentity_edges.append({
+                for m in arm.get("metrics", []):
+                    metrics.append({
+                        "parent_ns": "arm",
+                        "parent_id": index_map["arm_id"],
+                        "metric_id": index_map["metric_id"],
+                        "name": _clean(m.get("name", "")),
+                        "value_numeric": m.get("value_numeric"),
+                        "unit": _clean(m.get("unit", "")),
+                        "value_text": _clean(m.get("value_text", "")),
+                        "source_sentence": _clean(m.get("source_sentence", "")),
+                    })
+                    index_map["metric_id"] += 1
+                for ae in arm.get("adverse_events", []):
+                    adverse_events.append({
+                        "arm_id": index_map["arm_id"],
                         "adverseevent_id": index_map["ae_id"],
-                        "db": grounding["db"],
-                        "id": grounding["id"],
+                        "event_name": _clean(ae.get("event_name", "")),
+                        "incidence_numeric": ae.get("incidence_numeric"),
+                        "unit": _clean(ae.get("unit", "")),
+                        "value_text": _clean(ae.get("value_text", "")),
+                        "source_sentence": _clean(ae.get("source_sentence", "")),
                     })
-                index_map["ae_id"] += 1
-            index_map["arm_id"] += 1
+                    grounding = ae.get("grounding") or {}
+                    if grounding.get("db") and grounding.get("id"):
+                        ae_bioentity_edges.append({
+                            "adverseevent_id": index_map["ae_id"],
+                            "db": grounding["db"],
+                            "id": grounding["id"],
+                        })
+                    index_map["ae_id"] += 1
+                index_map["arm_id"] += 1
 
-        for item in data.get("inclusion_criteria", []):
-            criteria.append({
-                "result_id": result_id,
-                "criterion_id": index_map["criterion_id"],
-                "text": _clean(item.get("text", "")),
-                "criterion_type": "inclusion",
-                "evidence_text": _clean(item.get("evidence_text", "")),
-            })
-            index_map["criterion_id"] += 1
-
-        for item in data.get("exclusion_criteria", []):
-            criteria.append({
-                "result_id": result_id,
-                "criterion_id": index_map["criterion_id"],
-                "text": _clean(item.get("text", "")),
-                "criterion_type": "exclusion",
-                "evidence_text": _clean(item.get("evidence_text", "")),
-            })
-            index_map["criterion_id"] += 1
-
-        for item in data.get("results", []):
-            outcomes.append({
-                "result_id": result_id,
-                "outcome_id": index_map["outcome_id"],
-                "text": _clean(item.get("text", "")),
-                "evidence_text": _clean(item.get("evidence_text", "")),
-            })
-            index_map["outcome_id"] += 1
-
-        for comp in data.get("statistical_comparisons", []):
-            stat_comparisons.append({
-                "result_id": result_id,
-                "statcomparison_id": index_map["stat_id"],
-                "comparison_name": _clean(comp.get("comparison_name", "")),
-            })
-            for m in comp.get("metrics", []):
-                metrics.append({
-                    "parent_ns": "statcomparison",
-                    "parent_id": index_map["stat_id"],
-                    "metric_id": index_map["metric_id"],
-                    "name": _clean(m.get("name", "")),
-                    "value_numeric": m.get("value_numeric"),
-                    "unit": _clean(m.get("unit", "")),
-                    "value_text": _clean(m.get("value_text", "")),
-                    "source_sentence": _clean(m.get("source_sentence", "")),
-                })
-                index_map["metric_id"] += 1
-            index_map["stat_id"] += 1
-
-        grounded = data.get("genetic", {}).get("grounded_inclusion", [])
-        for entry in grounded:
-            for grounding in entry.get("groundings", []):
-                info = grounding.get("info", {})
-                if info.get("db") == "HGNC" and info.get("id"):
-                    genetic_edges.append({
+            for criterion_type in ("inclusion", "exclusion"):
+                # Prefer the grounded lists, which carry the same text plus a
+                # grounding, and fall back to the plain ones
+                items = data.get(f"grounded_{criterion_type}_criteria") or data.get(
+                    f"{criterion_type}_criteria", []
+                )
+                for item in items:
+                    criteria.append({
                         "result_id": result_id,
-                        "hgnc_id": info["id"],
-                        "symbol": info.get("entry_name", grounding.get("symbol", "")),
-                        "variant": entry.get("variant"),
-                        "evidence_text": _clean(entry.get("evidence_text", "")),
+                        "criterion_id": index_map["criterion_id"],
+                        "text": _clean(item.get("text", "")),
+                        "criterion_type": criterion_type,
+                        "evidence_text": _clean(item.get("evidence_text", "")),
                     })
+                    grounding = item.get("grounding") or {}
+                    if grounding.get("db") and grounding.get("id"):
+                        criterion_bioentity_edges.append({
+                            "criterion_id": index_map["criterion_id"],
+                            "db": grounding["db"],
+                            "id": grounding["id"],
+                        })
+                    index_map["criterion_id"] += 1
+
+            for arm in data.get("as_run_arms", []):
+                as_run_arms.append({
+                    "result_id": result_id,
+                    "as_run_arm_id": index_map["as_run_arm_id"],
+                    "group_label": _clean(arm.get("group_label") or ""),
+                    "intervention": _clean(arm.get("drug") or ""),
+                    "dosage": _clean(arm.get("dose") or ""),
+                    "route": _clean(arm.get("route") or ""),
+                    "schedule": _clean(arm.get("schedule") or ""),
+                    "evidence_text": _clean(arm.get("evidence_text") or ""),
+                })
+                index_map["as_run_arm_id"] += 1
+
+            for item in data.get("results", []):
+                outcomes.append({
+                    "result_id": result_id,
+                    "outcome_id": index_map["outcome_id"],
+                    "text": _clean(item.get("text", "")),
+                    "evidence_text": _clean(item.get("evidence_text", "")),
+                })
+                index_map["outcome_id"] += 1
+
+            for comp in data.get("statistical_comparisons", []):
+                stat_comparisons.append({
+                    "result_id": result_id,
+                    "statcomparison_id": index_map["stat_id"],
+                    "comparison_name": _clean(comp.get("comparison_name", "")),
+                })
+                for m in comp.get("metrics", []):
+                    metrics.append({
+                        "parent_ns": "statcomparison",
+                        "parent_id": index_map["stat_id"],
+                        "metric_id": index_map["metric_id"],
+                        "name": _clean(m.get("name", "")),
+                        "value_numeric": m.get("value_numeric"),
+                        "unit": _clean(m.get("unit", "")),
+                        "value_text": _clean(m.get("value_text", "")),
+                        "source_sentence": _clean(m.get("source_sentence", "")),
+                    })
+                    index_map["metric_id"] += 1
+                index_map["stat_id"] += 1
+
+            grounded = data.get("genetic", {}).get("grounded_inclusion", [])
+            for entry in grounded:
+                for grounding in entry.get("groundings", []):
+                    info = grounding.get("info", {})
+                    if info.get("db") == "HGNC" and info.get("id"):
+                        genetic_edges.append({
+                            "result_id": result_id,
+                            "hgnc_id": info["id"],
+                            "symbol": info.get("entry_name", grounding.get("symbol", "")),
+                            "variant": entry.get("variant"),
+                            "evidence_text": _clean(entry.get("evidence_text", "")),
+                        })
 
     logger.info("Extracted %d TrialArm nodes", len(arms))
+    logger.info("Extracted %d TrialAsRunArm nodes", len(as_run_arms))
     logger.info("Extracted %d TrialMetric nodes", len(metrics))
     logger.info("Extracted %d TrialAdverseEvent nodes", len(adverse_events))
     logger.info("Extracted %d TrialCriterion nodes", len(criteria))
@@ -626,6 +709,7 @@ def load_all(
     logger.info("Extracted %d TrialStatisticalComparison nodes", len(stat_comparisons))
     logger.info("Extracted %d has_genetic_criterion edges", len(genetic_edges))
     logger.info("Extracted %d adverse_event_grounded_as edges", len(ae_bioentity_edges))
+    logger.info("Extracted %d criterion_grounded_as edges", len(criterion_bioentity_edges))
 
     genetic_edges_df = pd.DataFrame(genetic_edges)
     if not genetic_edges_df.empty:
@@ -644,9 +728,16 @@ def load_all(
             len(ae_bioentity_edges_df),
         )
 
+    criterion_bioentity_edges_df = pd.DataFrame(criterion_bioentity_edges)
+    if not criterion_bioentity_edges_df.empty:
+        criterion_bioentity_edges_df = criterion_bioentity_edges_df.drop_duplicates(
+            subset=["criterion_id", "db", "id"]
+        )
+
     return {
         "result_nodes": pd.DataFrame(result_nodes),
         "arms": pd.DataFrame(arms),
+        "as_run_arms": pd.DataFrame(as_run_arms),
         "metrics": pd.DataFrame(metrics),
         "adverse_events": pd.DataFrame(adverse_events),
         "criteria": pd.DataFrame(criteria),
@@ -654,5 +745,6 @@ def load_all(
         "stat_comparisons": pd.DataFrame(stat_comparisons),
         "genetic_edges": genetic_edges_df,
         "ae_bioentity_edges": ae_bioentity_edges_df,
-        "publication_edges": pd.DataFrame(publication_edges),
+        "criterion_bioentity_edges": criterion_bioentity_edges_df,
+        "source_edges": pd.DataFrame(source_edges),
     }

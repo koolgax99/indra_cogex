@@ -330,6 +330,7 @@ def assert_valid_node(
     elif db_ns in {
         "trial.result", "trial.arm", "trial.metric", "trial.adverseevent",
         "trial.criterion", "trial.outcome", "trial.statcomparison",
+        "trial.asrunarm",
     }:
         pass
     else:

@@ -199,17 +199,19 @@ class ClinicaltrialsProcessor(Processor):
 
 
 class ClinicalTrialResultProcessor(Processor):
-    """Processor for clinical trial result nodes extracted from publications.
+    """Processor for clinical trial result nodes extracted by LLMs.
 
-    Reads LLM-extracted, grounded JSONs and produces 7 different types of nodes,
-    each with their own node label and 9 relationship types connecting the nodes
-    to each other.
+    Reads LLM-extracted, grounded JSONs from publications (PubMed) and registry
+    records (ClinicalTrials.gov) and produces 8 different types of nodes, each
+    with their own node label, and 11 relationship types connecting the nodes
+    to each other and to Publication, ClinicalTrial and BioEntity nodes.
     """
 
     name = "clinical_trial_results"
     node_types = [
         "TrialResult",
         "TrialArm",
+        "TrialAsRunArm",
         "TrialMetric",
         "TrialAdverseEvent",
         "TrialCriterion",
@@ -222,6 +224,7 @@ class ClinicalTrialResultProcessor(Processor):
         data = load_all(look_up_current_max_ids=look_up_current_max_ids)
         self.result_nodes_df = data["result_nodes"]
         self.arms_df = data["arms"]
+        self.as_run_arms_df = data["as_run_arms"]
         self.metrics_df = data["metrics"]
         self.adverse_events_df = data["adverse_events"]
         self.criteria_df = data["criteria"]
@@ -229,7 +232,8 @@ class ClinicalTrialResultProcessor(Processor):
         self.stat_comparisons_df = data["stat_comparisons"]
         self.genetic_edges_df = data["genetic_edges"]
         self.ae_bioentity_edges_df = data["ae_bioentity_edges"]
-        self.publication_edges_df = data["publication_edges"]
+        self.criterion_bioentity_edges_df = data["criterion_bioentity_edges"]
+        self.source_edges_df = data["source_edges"]
 
     def get_nodes(self):
         for _, row in tqdm.tqdm(self.result_nodes_df.iterrows(),
@@ -243,6 +247,12 @@ class ClinicalTrialResultProcessor(Processor):
                     "study_info": clean_whitespace(row["study_info"]),
                     "trial_ids:string[]": clean_whitespace(row["trial_ids:string[]"]),
                     "locations:string[]": clean_whitespace(row["locations:string[]"]),
+                    "randomization_ratio": clean_whitespace(row["randomization_ratio"]),
+                    "randomization_stratification_factors:string[]": clean_whitespace(
+                        row["randomization_stratification_factors:string[]"]
+                    ),
+                    "recruitment_channel": clean_whitespace(row["recruitment_channel"]),
+                    "recruitment_window": clean_whitespace(row["recruitment_window"]),
                 },
             )
 
@@ -255,9 +265,27 @@ class ClinicalTrialResultProcessor(Processor):
                 labels=["TrialArm"],
                 data={
                     "arm_name": clean_whitespace(row["arm_name"]),
+                    "arm_type": clean_whitespace(row["arm_type"]),
                     "n:int": or_na(row["n"]),
                     "dosage": clean_whitespace(row["dosage"]),
                     "source_sentence": clean_whitespace(row["source_sentence"]),
+                },
+            )
+
+        for _, row in tqdm.tqdm(self.as_run_arms_df.iterrows(),
+                                total=len(self.as_run_arms_df),
+                                desc="TrialAsRunArm nodes"):
+            yield Node(
+                db_ns="trial.asrunarm",
+                db_id=str(row["as_run_arm_id"]),
+                labels=["TrialAsRunArm"],
+                data={
+                    "group_label": clean_whitespace(row["group_label"]),
+                    "intervention": clean_whitespace(row["intervention"]),
+                    "dosage": clean_whitespace(row["dosage"]),
+                    "route": clean_whitespace(row["route"]),
+                    "schedule": clean_whitespace(row["schedule"]),
+                    "evidence_text": clean_whitespace(row["evidence_text"]),
                 },
             )
 
@@ -332,9 +360,11 @@ class ClinicalTrialResultProcessor(Processor):
                 },
             )
 
-        for pmid in tqdm.tqdm(self.publication_edges_df["pmid"].unique(),
-                              total=len(self.publication_edges_df["pmid"].unique()),
-                              desc="Publication nodes"):
+        # ClinicalTrial nodes are created by ClinicaltrialsProcessor
+        pmids = self.source_edges_df.loc[
+            self.source_edges_df["source_ns"] == "PUBMED", "source_id"
+        ].unique()
+        for pmid in tqdm.tqdm(pmids, total=len(pmids), desc="Publication nodes"):
             yield Node(
                 db_ns="PUBMED",
                 db_id=clean_whitespace(pmid),
@@ -343,12 +373,12 @@ class ClinicalTrialResultProcessor(Processor):
             )
 
     def get_relations(self):
-        for _, row in tqdm.tqdm(self.publication_edges_df.iterrows(),
-                                total=len(self.publication_edges_df),
-                                desc="Publication->TrialResult"):
+        for _, row in tqdm.tqdm(self.source_edges_df.iterrows(),
+                                total=len(self.source_edges_df),
+                                desc="Publication/ClinicalTrial->TrialResult"):
             yield Relation(
-                source_ns="PUBMED",
-                source_id=clean_whitespace(row["pmid"]),
+                source_ns=row["source_ns"],
+                source_id=clean_whitespace(row["source_id"]),
                 target_ns="trial.result",
                 target_id=str(row["result_id"]),
                 rel_type="has_trial_result",
@@ -363,6 +393,17 @@ class ClinicalTrialResultProcessor(Processor):
                 target_ns="trial.arm",
                 target_id=str(row["arm_id"]),
                 rel_type="has_arm",
+            )
+
+        for _, row in tqdm.tqdm(self.as_run_arms_df.iterrows(),
+                                total=len(self.as_run_arms_df),
+                                desc="TrialResult->TrialAsRunArm"):
+            yield Relation(
+                source_ns="trial.result",
+                source_id=str(row["result_id"]),
+                target_ns="trial.asrunarm",
+                target_id=str(row["as_run_arm_id"]),
+                rel_type="has_as_run_arm",
             )
 
         for _, row in tqdm.tqdm(
@@ -452,6 +493,17 @@ class ClinicalTrialResultProcessor(Processor):
                 target_ns=row["db"],
                 target_id=row["id"],
                 rel_type="adverse_event_grounded_as",
+            )
+
+        for _, row in tqdm.tqdm(self.criterion_bioentity_edges_df.iterrows(),
+                                total=len(self.criterion_bioentity_edges_df),
+                                desc="TrialCriterion->BioEntity"):
+            yield Relation(
+                source_ns="trial.criterion",
+                source_id=str(row["criterion_id"]),
+                target_ns=row["db"],
+                target_id=row["id"],
+                rel_type="criterion_grounded_as",
             )
 
         # The TrialResults are already linked to ClinicalTrials:
